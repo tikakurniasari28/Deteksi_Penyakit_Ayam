@@ -120,8 +120,8 @@ def segmentasi_feses(img_bgr):
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     # Range 1: coklat/gelap (feses umum)
     mask1 = cv2.inRange(hsv,
-                         np.array([5,  40,  20]),
-                         np.array([25, 255, 120]))
+        np.array([0,20,20]),
+        np.array([40,255,180]))
 
     # Range 2: putih/krem (feses sehat)
     mask2 = cv2.inRange(hsv,
@@ -191,6 +191,7 @@ class AplikasiAyam:
         self.inactive_frames = defaultdict(int)
         self.heatmap         = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
         self.last_annotated  = None
+        self.feses_done      = False 
 
         # Stats
         self.stat_total      = tk.StringVar(value="0")
@@ -365,8 +366,9 @@ class AplikasiAyam:
         self.inactive_frames = defaultdict(int)
         self.heatmap         = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
         self.last_annotated  = None
+        self.feses_done      = False 
 
-    # ── LOOP VIDEO ───────────────────────────────────────────────────────────
+    # LOOP VIDEO 
 
     def _loop_video(self):
         final_behavior = {}
@@ -467,13 +469,11 @@ class AplikasiAyam:
 
                     update_heatmap(self.heatmap, int(x), int(y), int(w), int(h))
 
-            # ── DETEKSI FESES (setiap 15 frame) ──
-            feses_interval += 1
-            if feses_interval >= 15:
-                feses_interval = 0
+            # ── DETEKSI FESES (HANYA FRAME AWAL, 1 KALI SAJA) ──
+            if self.frame_count % 30 == 0:
                 mask_feses = segmentasi_feses(frame)
-                
-                roi_start = int(HEIGHT * 0.4)
+
+                roi_start = int(HEIGHT * 0.75)
                 mask_feses[:roi_start, :] = 0
 
                 contours, _ = cv2.findContours(mask_feses,
@@ -482,20 +482,26 @@ class AplikasiAyam:
                 feses_results = []
                 for cnt in contours:
                     area_cnt = cv2.contourArea(cnt)
-                    if area_cnt < 300 or area_cnt >1500:
+                    if area_cnt < 500 or area_cnt > 10000:
                         continue
                     fx, fy, fw, fh = cv2.boundingRect(cnt)
+                    extent = area_cnt / (fw * fh + 1e-6)
+
+                    if extent < 0.4:
+                        continue
 
                     rasio = fw / (fh + 1e-6)
                     if rasio > 5 or rasio < 0.2:
                         continue
-                    # Pastikan crop tidak keluar frame
-                    fx2 = min(fx+fw, WIDTH);  fy2 = min(fy+fh, HEIGHT)
+                    fx2 = min(fx + fw, WIDTH)
+                    fy2 = min(fy + fh, HEIGHT)
                     crop = frame[fy:fy2, fx:fx2]
                     if crop.size == 0:
                         continue
                     flabel, fconf, _ = predict_feses(crop)
                     feses_results.append((fx, fy, fx2, fy2, flabel, fconf))
+
+                self.feses_done = True  
 
             # Gambar hasil feses di frame
             for (fx, fy, fx2, fy2, flabel, fconf) in feses_results:
