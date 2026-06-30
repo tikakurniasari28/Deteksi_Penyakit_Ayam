@@ -1,12 +1,15 @@
 import os
 import cv2
 import time
+import queue
 import threading
 import numpy as np
 import pickle
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
 from PIL import Image, ImageTk
 import tensorflow as tf
 from ultralytics import YOLO
@@ -171,6 +174,79 @@ def update_heatmap(heatmap, cx, cy, w, h):
 
 
 # =====================================================
+# SKEMA EVENT TERPUSAT
+# =====================================================
+# Tiga sumber deteksi (perilaku, ukuran, feses) menulis ke struktur yang
+# SAMA ini, supaya panel "Riwayat Deteksi" tidak perlu tahu detail tiap
+# model -- dia cuma tahu cara menampilkan DetectionEvent.
+
+STATUS_COLOR_HEX = {
+    "normal":    "#a6e3a1",
+    "perhatian": "#f9e2af",
+    "kritis":    "#f38ba8",
+}
+
+# Pemetaan label asli model -> status kesehatan, dipakai biar panel
+# riwayat & ringkasan tahu mana yang perlu disorot merah/kuning.
+BEHAVIOR_STATUS = {
+    "Sangat Aktif": "normal",
+    "Aktif":        "normal",
+    "Diam":         "perhatian",
+    "Tidak Aktif":  "kritis",
+}
+
+SIZE_STATUS = {
+    "Kecil":  "perhatian",
+    "Sedang": "normal",
+    "Besar":  "normal",
+}
+
+FESES_STATUS = {
+    "healthy": "normal",
+    "cocci":   "kritis",
+    "ncd":     "kritis",
+    "salmo":   "kritis",
+}
+
+
+@dataclass
+class DetectionEvent:
+    modul: str                 # "perilaku" | "ukuran" | "feses"
+    label: str                  # contoh: "Tidak Aktif", "Kecil", "Coccidiosis"
+    confidence: float           # 0.0 - 1.0
+    status: str                  # "normal" | "perhatian" | "kritis"
+    ekor_id: int | None = None     # track id dari ByteTrack, kalau ada
+    waktu: datetime = field(default_factory=datetime.now)
+
+    def warna(self) -> str:
+        return STATUS_COLOR_HEX.get(self.status, "#cdd6f4")
+
+
+class DetectionBus:
+    """Queue thread-safe antara loop video (thread terpisah) dan GUI (main thread).
+
+    _loop_video jalan di background thread, jadi tidak boleh langsung
+    menyentuh widget Tkinter. Dia publish ke sini, lalu GUI poll lewat
+    root.after() di main thread.
+    """
+
+    def __init__(self) -> None:
+        self._q: "queue.Queue[DetectionEvent]" = queue.Queue()
+
+    def publish(self, event: DetectionEvent) -> None:
+        self._q.put(event)
+
+    def drain(self) -> list[DetectionEvent]:
+        events = []
+        while True:
+            try:
+                events.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+        return events
+
+
+# =====================================================
 # APLIKASI TKINTER
 # =====================================================
 
@@ -192,6 +268,11 @@ class AplikasiAyam:
         self.heatmap         = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
         self.last_annotated  = None
         self.feses_done      = False 
+
+        # Event terpusat: tempat ketiga model menulis hasil deteksinya
+        self.bus              = DetectionBus()
+        self.history: list    = []
+        self.last_status      = {}   # (modul, ekor_id) -> status terakhir, biar tidak spam event tiap frame
 
         # Stats
         self.stat_total      = tk.StringVar(value="0")
@@ -274,6 +355,9 @@ class AplikasiAyam:
         self._panel_ukuran(right)
         self._panel_feses(right)
         self._panel_status(right)
+        self._panel_riwayat(right)
+
+        self._poll_bus()
 
     def _section(self, parent, title, color):
         frm = tk.Frame(parent, bg="#181825")
@@ -317,6 +401,40 @@ class AplikasiAyam:
                         font=("Segoe UI", 13, "bold"),
                         bg="#181825", fg="#f38ba8")
         lbl.pack(pady=8)
+
+    def _panel_riwayat(self, parent):
+        f = self._section(parent, "Riwayat Deteksi", "#89b4fa")
+        cols = ("waktu", "hasil")
+        self.tree_riwayat = ttk.Treeview(f, columns=cols, show="headings", height=8)
+        self.tree_riwayat.heading("waktu", text="Waktu")
+        self.tree_riwayat.heading("hasil", text="Hasil")
+        self.tree_riwayat.column("waktu", width=60, anchor="w")
+        self.tree_riwayat.column("hasil", width=200, anchor="w")
+        self.tree_riwayat.pack(fill="both", expand=True, pady=(0, 8))
+
+        style = ttk.Style()
+        style.configure("Treeview", background="#181825", fieldbackground="#181825",
+                        foreground="#cdd6f4", font=("Segoe UI", 8))
+        style.configure("Treeview.Heading", background="#1e1e2e", foreground="#6c7086")
+
+        self.tree_riwayat.tag_configure("normal", foreground="#a6e3a1")
+        self.tree_riwayat.tag_configure("perhatian", foreground="#f9e2af")
+        self.tree_riwayat.tag_configure("kritis", foreground="#f38ba8")
+
+    def _poll_bus(self):
+        """Dipanggil berkala lewat root.after() di main thread -- satu-satunya
+        tempat yang aman buat update widget Tkinter dari hasil di DetectionBus."""
+        events = self.bus.drain()
+        for ev in events:
+            self.history.insert(0, ev)
+            teks = ev.label if ev.ekor_id is None else f"ID:{ev.ekor_id} {ev.label}"
+            self.tree_riwayat.insert("", 0, values=(ev.waktu.strftime("%H:%M:%S"), teks),
+                                      tags=(ev.status,))
+            children = self.tree_riwayat.get_children()
+            if len(children) > 50:
+                self.tree_riwayat.delete(children[-1])
+        self.history = self.history[:200]
+        self.root.after(500, self._poll_bus)
 
     # ── VIDEO CONTROL ────────────────────────────────────────────────────────
 
@@ -364,7 +482,7 @@ class AplikasiAyam:
         self.frame_count     = 0
         self.track_history   = defaultdict(list)
         self.inactive_frames = defaultdict(int)
-        self.heatmap         = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+        self.heatmap          = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
         self.last_annotated  = None
         self.feses_done      = False 
 
@@ -444,6 +562,23 @@ class AplikasiAyam:
                     final_size[tid]   = size
                     final_weight[tid] = weight
 
+                    # ── Publish event ke DetectionBus, cuma kalau statusnya berubah ──
+                    beh_status = BEHAVIOR_STATUS.get(behavior, "normal")
+                    if self.last_status.get(("perilaku", tid)) != beh_status:
+                        self.last_status[("perilaku", tid)] = beh_status
+                        self.bus.publish(DetectionEvent(
+                            modul="perilaku", label=behavior,
+                            confidence=float(conf), status=beh_status, ekor_id=int(tid),
+                        ))
+
+                    size_status = SIZE_STATUS.get(size, "normal")
+                    if self.last_status.get(("ukuran", tid)) != size_status:
+                        self.last_status[("ukuran", tid)] = size_status
+                        self.bus.publish(DetectionEvent(
+                            modul="ukuran", label=f"{size} (~{weight}g)",
+                            confidence=float(conf), status=size_status, ekor_id=int(tid),
+                        ))
+
                     # ── Gambar bbox ──
                     beh_color  = BEHAVIOR_COLOR.get(behavior, (255,255,255))
                     size_color = SIZE_COLOR.get(size, (255,255,255))
@@ -500,6 +635,13 @@ class AplikasiAyam:
                         continue
                     flabel, fconf, _ = predict_feses(crop)
                     feses_results.append((fx, fy, fx2, fy2, flabel, fconf))
+
+                    nama_f, _ = FESES_MAP.get(flabel, (flabel, "#fff"))
+                    self.bus.publish(DetectionEvent(
+                        modul="feses", label=nama_f,
+                        confidence=float(fconf) / 100,
+                        status=FESES_STATUS.get(flabel, "perhatian"),
+                    ))
 
                 self.feses_done = True  
 
